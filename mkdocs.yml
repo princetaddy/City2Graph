@@ -1,21 +1,32 @@
 site_name: City2Graph
-site_url: !ENV [READTHEDOCS_CANONICAL_URL, 'https://city2graph.net/latest/']
+site_url: https://city2graph.net/latest/
 site_author: Yuta Sato
 site_description: >-
-  City2Graph is a Python library to transform geospatial data (OSM, GTFS, POIs)
-  into heterogeneous graphs for Urban Network Analysis and Graph Neural Networks
-  (GNNs).
+  Build spatial and heterogeneous graphs from buildings, streets, GTFS feeds,
+  OD matrices, and POIs for NetworkX analysis and PyTorch Geometric GNNs.
 repo_url: https://github.com/c2g-dev/city2graph
 repo_name: c2g-dev/city2graph
 copyright: Copyright &copy; 2026 Yuta Sato & City2Graph developers
 use_directory_urls: false
 
+# Keep untracked local artifacts (old notebooks, notebook caches, raw data)
+# out of the build. They are gitignored but present in local checkouts.
+exclude_docs: |
+  .DS_Store
+  examples/gtfs_old.ipynb
+  examples/city2graph_overture.ipynb
+  examples/cache/
+  examples/data/
+  examples/generate_thumbnail.py
+  examples/thumbnail.png
+  assets/data/
+
 theme:
   name: material
   custom_dir: docs/overrides  # If you need to override templates
-  font:
-    text: Inter
-    code: JetBrains Mono
+  # Fonts are loaded once in stylesheets/custom.css (Inter, Fira Code, Outfit)
+  # to avoid a duplicate Google Fonts request from the theme.
+  font: false
 
   palette:
     # Auto mode (follows system preference) - Default
@@ -98,9 +109,9 @@ plugins:
             - https://fiona.readthedocs.io/en/latest/objects.inv
             - https://www.rustworkx.org/objects.inv
             - https://pytorch.org/docs/stable/objects.inv
-            - http://docs.momepy.org/en/stable/objects.inv
+            - https://docs.momepy.org/stable/objects.inv
             - https://osmnx.readthedocs.io/en/stable/objects.inv
-            - https://pysal.org/libpysal/objects.inv
+            - https://pysal.org/libpysal/stable/objects.inv
           options:
             # General options
             show_source: false
@@ -173,6 +184,7 @@ markdown_extensions:
   - toc:
       permalink: true
   - attr_list
+  - md_in_html
   - pymdownx.arithmatex:  # MathJax support
       generic: true
 
@@ -197,8 +209,8 @@ nav:
       - Overview of City2Graph Examples: examples/index.md
       - Metapath Construction for Heterogeneous GNNs: examples/add_metapaths.ipynb
       - Morphological Graphs from Overture Maps & OpenStreetMap: examples/morphological_graph_from_overturemaps.ipynb  # yamllint disable-line rule:line-length
-      - GTFS to Graphs: examples/gtfs.ipynb
-      - OD Matrix to Graphs: examples/generating_graphs_from_od_matrix.ipynb
+      - GTFS to Public Transit Graphs: examples/gtfs.ipynb
+      - OD Matrices to Mobility Graphs: examples/generating_graphs_from_od_matrix.ipynb
       - Spatial Proximity Graphs: examples/generating_graphs_by_proximity.ipynb
   - API Reference:
       - Overview: api/index.md

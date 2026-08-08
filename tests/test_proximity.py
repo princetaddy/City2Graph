@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 import geopandas as gpd
 import networkx as nx
+import numpy as np
 import pandas as pd
 import pytest
 from shapely.geometry import LineString
@@ -112,10 +113,48 @@ def test_delaunay_and_subgraphs(small_points: gpd.GeoDataFrame) -> None:
     assert len(r_edges) <= len(d_edges)
 
 
+def test_triangulation_hierarchy_matches_brute_force() -> None:
+    """MST ⊆ RNG ⊆ Gabriel ⊆ Delaunay, and Gabriel matches its brute-force definition.
+
+    Uses large projected-CRS-like coordinates to guard against floating-point
+    regressions in the disc-emptiness predicate (previously valid Gabriel
+    edges were dropped when coordinates were far from the origin).
+    """
+    rng = np.random.default_rng(42)
+    coords = rng.uniform(0.0, 5000.0, size=(150, 2)) + np.array([350_000.0, 5_700_000.0])
+    pts = make_points_simple([(float(x), float(y)) for x, y in coords], crs="EPSG:32633")
+
+    def edge_set(edges: gpd.GeoDataFrame) -> set[tuple[int, int]]:
+        return {(min(int(u), int(v)), max(int(u), int(v))) for u, v in edges.index}
+
+    _, d_edges = delaunay_graph(pts)
+    _, g_edges = gabriel_graph(pts)
+    _, r_edges = relative_neighborhood_graph(pts)
+    _, m_edges = euclidean_minimum_spanning_tree(pts)
+    delaunay, gabriel, rng_graph, mst = map(edge_set, (d_edges, g_edges, r_edges, m_edges))
+
+    # Brute-force Gabriel: keep a Delaunay edge iff no other point lies
+    # strictly inside the open disc having the edge as its diameter.
+    expected_gabriel = set()
+    for i, j in delaunay:
+        mid = 0.5 * (coords[i] + coords[j])
+        rad2 = np.sum((coords[i] - coords[j]) ** 2) * 0.25
+        d2 = np.sum((coords - mid) ** 2, axis=1)
+        d2[[i, j]] = np.inf
+        if not np.any(d2 < rad2):
+            expected_gabriel.add((i, j))
+
+    assert gabriel == expected_gabriel
+    assert mst <= rng_graph <= gabriel <= delaunay
+
+
 def test_mst_and_waxman(small_points: gpd.GeoDataFrame) -> None:
     """MST has n-1 edges and Waxman returns expected schema."""
     _, mst_edges = euclidean_minimum_spanning_tree(small_points)
     assert len(mst_edges) == max(len(small_points) - 1, 0)
+    mst_nx = euclidean_minimum_spanning_tree(small_points, as_nx=True)
+    assert isinstance(mst_nx, nx.Graph)
+    assert mst_nx.number_of_edges() == len(mst_edges)
     _, wax_edges = waxman_graph(small_points, beta=0.8, r0=2.0, seed=7)
     # Probabilistic: just ensure schema
     assert {"weight", "geometry"}.issubset(wax_edges.columns)
@@ -262,6 +301,76 @@ def test_contiguity_empty_input() -> None:
 def test_contiguity_network_requires_network_gdf() -> None:
     """Network metric without network_gdf raises ValueError."""
     assert_network_metric_requires_network_gdf(contiguity_graph, make_square_polygons())
+
+
+# ---------------------------------------------------------------------------
+# duplicate_edges public API coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda gdf, **kw: knn_graph(gdf, k=2, **kw),
+        delaunay_graph,
+        gabriel_graph,
+        relative_neighborhood_graph,
+        euclidean_minimum_spanning_tree,
+        lambda gdf, **kw: fixed_radius_graph(gdf, radius=1.5, **kw),
+        lambda gdf, **kw: waxman_graph(gdf, beta=0.9, r0=2.0, seed=42, **kw),
+    ],
+    ids=["knn", "delaunay", "gabriel", "rng", "emst", "fixed_radius", "waxman"],
+)
+def test_duplicate_edges_adds_reverse_rows(
+    small_points: gpd.GeoDataFrame,
+    build: Callable[..., tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]],
+) -> None:
+    """duplicate_edges=True adds the reverse row of every undirected edge."""
+    _, base_edges = build(small_points)
+    _, dup_edges = build(small_points, duplicate_edges=True)
+
+    pairs = set(base_edges.index)
+    assert len(dup_edges) == 2 * len(base_edges)
+    assert set(dup_edges.index) == pairs | {(v, u) for u, v in pairs}
+
+
+def test_contiguity_duplicate_edges_completes_neighbor_queries() -> None:
+    """duplicate_edges=True makes MultiIndex neighbour queries complete (issue #156)."""
+    gdf = make_square_polygons()
+    _, base_edges = contiguity_graph(gdf, contiguity="queen")
+    _, dup_edges = contiguity_graph(gdf, contiguity="queen", duplicate_edges=True)
+
+    assert len(dup_edges) == 2 * len(base_edges)
+    srcs = base_edges.index.get_level_values(0)
+    dsts = base_edges.index.get_level_values(1)
+    for node in gdf.index:
+        forward = set(base_edges.xs(node, level=0).index) if node in srcs else set()
+        backward = set(base_edges.xs(node, level=1).index) if node in dsts else set()
+        neighbors = set(dup_edges.xs(node, level=0).index)
+        assert neighbors == forward | backward
+
+
+def test_duplicate_edges_rejects_as_nx() -> None:
+    """duplicate_edges=True with as_nx=True raises ValueError."""
+    gdf = make_square_polygons()
+    with pytest.raises(ValueError, match="not supported with as_nx=True"):
+        contiguity_graph(gdf, duplicate_edges=True, as_nx=True)
+
+
+def test_duplicate_edges_rejects_target_gdf(small_points: gpd.GeoDataFrame) -> None:
+    """duplicate_edges=True with target_gdf (directed variant) raises ValueError."""
+    with pytest.raises(ValueError, match="not supported with target_gdf"):
+        knn_graph(small_points, k=2, target_gdf=small_points, duplicate_edges=True)
+    with pytest.raises(ValueError, match="not supported with target_gdf"):
+        fixed_radius_graph(small_points, radius=1.5, target_gdf=small_points, duplicate_edges=True)
+
+
+def test_contiguity_duplicate_edges_empty_input() -> None:
+    """Empty input with duplicate_edges=True returns empty GeoDataFrames."""
+    empty = gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs="EPSG:3857")
+    nodes, edges = contiguity_graph(empty, duplicate_edges=True)
+    assert nodes.empty
+    assert edges.empty
 
 
 # ---------------------------------------------------------------------------
@@ -1125,3 +1234,160 @@ class TestNetworkMetricPublicApis:
         )
 
         assert_valid_proximity_result(nodes, edges, 2)
+
+
+# ---------------------------------------------------------------------------
+# Sparse neighbour queries (issue #190): no dense distance matrices
+# ---------------------------------------------------------------------------
+
+
+def _raise_dense_matrix_error(_self: object, _coords: object) -> None:
+    """Fail the test if any builder materialises a dense distance matrix."""
+    msg = "dense distance matrix must not be materialised"
+    raise AssertionError(msg)
+
+
+def _make_chain_points_and_network() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Return four points sitting exactly on the nodes of a unit chain network."""
+    pts = make_points_simple([(0, 0), (1, 0), (2, 0), (3, 0)])
+    net = make_network_edges(
+        src_ids=[0, 1, 2],
+        dst_ids=[1, 2, 3],
+        geometries=[
+            LineString([(0, 0), (1, 0)]),
+            LineString([(1, 0), (2, 0)]),
+            LineString([(2, 0), (3, 0)]),
+        ],
+        crs=pts.crs,
+    )
+    return pts, net
+
+
+def _undirected_edge_weights(edges: gpd.GeoDataFrame) -> dict[tuple[object, object], float]:
+    """Map sorted (u, v) index pairs to edge weights."""
+    return {
+        tuple(sorted((u, v))): float(w)
+        for (u, v), w in zip(edges.index, edges["weight"], strict=True)
+    }
+
+
+@pytest.mark.parametrize(
+    ("builder_name", "metric"),
+    [
+        ("knn", "euclidean"),
+        ("knn", "manhattan"),
+        ("knn", "network"),
+        ("fixed_radius", "euclidean"),
+        ("fixed_radius", "network"),
+        ("mst", "euclidean"),
+        ("mst", "network"),
+        ("knn_directed", "network"),
+        ("fixed_radius_directed", "network"),
+    ],
+)
+def test_proximity_builders_avoid_dense_matrix(
+    small_points: gpd.GeoDataFrame,
+    network_edges: gpd.GeoDataFrame,
+    monkeypatch: pytest.MonkeyPatch,
+    builder_name: str,
+    metric: str,
+) -> None:
+    """Graph builders never call DistanceMetric.matrix (regression for issue #190)."""
+    monkeypatch.setattr("city2graph.proximity.DistanceMetric.matrix", _raise_dense_matrix_error)
+    net = network_edges if metric == "network" else None
+    src = small_points.iloc[:2]
+    dst = small_points.iloc[2:]
+
+    if builder_name == "knn":
+        nodes, edges = knn_graph(small_points, k=1, distance_metric=metric, network_gdf=net)
+        assert_valid_proximity_result(nodes, edges, len(small_points), allow_empty_edges=False)
+    elif builder_name == "fixed_radius":
+        nodes, edges = fixed_radius_graph(
+            small_points, radius=2.5, distance_metric=metric, network_gdf=net
+        )
+        assert_valid_proximity_result(nodes, edges, len(small_points))
+    elif builder_name == "mst":
+        nodes, edges = euclidean_minimum_spanning_tree(
+            small_points, distance_metric=metric, network_gdf=net
+        )
+        assert len(edges) <= max(len(small_points) - 1, 0)
+    elif builder_name == "knn_directed":
+        nodes, edges = knn_graph(src, k=1, distance_metric=metric, network_gdf=net, target_gdf=dst)
+        assert_valid_proximity_result(nodes, edges, len(small_points))
+    else:  # fixed_radius_directed
+        nodes, edges = fixed_radius_graph(
+            src, radius=2.5, distance_metric=metric, network_gdf=net, target_gdf=dst
+        )
+        assert_valid_proximity_result(nodes, edges, len(small_points))
+
+
+def test_fixed_radius_network_cutoff_matches_bruteforce() -> None:
+    """Cutoff-bounded Dijkstra returns the exact edge set, including the boundary."""
+    pts, net = _make_chain_points_and_network()
+    _, edges = fixed_radius_graph(pts, radius=2.0, distance_metric="network", network_gdf=net)
+
+    weights = _undirected_edge_weights(edges)
+    # Path lengths on the unit chain: 1 for adjacent pairs, 2 for one-apart pairs.
+    # The pair (0, 3) at distance 3 must be excluded; distance == radius is included.
+    expected = {(0, 1): 1.0, (1, 2): 1.0, (2, 3): 1.0, (0, 2): 2.0, (1, 3): 2.0}
+    assert set(weights) == set(expected)
+    for pair, dist in expected.items():
+        assert weights[pair] == pytest.approx(dist)
+
+
+def test_knn_network_k_exceeds_point_count() -> None:
+    """K larger than n - 1 connects every reachable pair on the network."""
+    pts, net = _make_chain_points_and_network()
+    _, edges = knn_graph(pts, k=10, distance_metric="network", network_gdf=net)
+
+    weights = _undirected_edge_weights(edges)
+    expected = {
+        (0, 1): 1.0,
+        (0, 2): 2.0,
+        (0, 3): 3.0,
+        (1, 2): 1.0,
+        (1, 3): 2.0,
+        (2, 3): 1.0,
+    }
+    assert set(weights) == set(expected)
+    for pair, dist in expected.items():
+        assert weights[pair] == pytest.approx(dist)
+
+
+def test_directed_network_radius_exact_edges() -> None:
+    """Directed radius selection yields the exact edge set with network weights."""
+    pts, net = _make_chain_points_and_network()
+    src = pts.iloc[[0, 3]]
+    dst = pts.iloc[[1, 2]]
+    _, edges = fixed_radius_graph(
+        src, radius=1.0, distance_metric="network", network_gdf=net, target_gdf=dst
+    )
+
+    pairs = {(u, v): float(w) for (u, v), w in zip(edges.index, edges["weight"], strict=True)}
+    expected = {(("src", 0), ("dst", 1)): 1.0, (("src", 3), ("dst", 2)): 1.0}
+    assert set(pairs) == set(expected)
+    for pair, dist in expected.items():
+        assert pairs[pair] == pytest.approx(dist)
+
+
+def test_bridge_nodes_network_fixed_radius_exact_edges() -> None:
+    """bridge_nodes fixed_radius with network metric respects the radius cutoff."""
+    pts, net = _make_chain_points_and_network()
+    layers = {"a": pts.iloc[[0, 3]], "b": pts.iloc[[1, 2]]}
+    _, edges = bridge_nodes(
+        layers,
+        proximity_method="fixed_radius",
+        radius=1.0,
+        distance_metric="network",
+        network_gdf=net,
+    )
+
+    expected = {
+        ("a", "is_nearby", "b"): {(0, 1), (3, 2)},
+        ("b", "is_nearby", "a"): {(1, 0), (2, 3)},
+    }
+    assert set(edges) == set(expected)
+    for relation, pairs in expected.items():
+        gdf = edges[relation]
+        assert set(gdf.index) == pairs
+        assert all(w == pytest.approx(1.0) for w in gdf["weight"])

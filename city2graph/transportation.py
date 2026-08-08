@@ -8,24 +8,30 @@ graphs for downstream network analysis.
 
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
+import warnings
 import zipfile
-from contextlib import suppress
 from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import duckdb
 import geopandas as gpd
-import networkx as nx
 import pandas as pd
 from shapely import wkt
+
+from .utils import gdf_to_nx
+
+if TYPE_CHECKING:
+    import networkx as nx
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-__all__ = ["get_od_pairs", "load_gtfs", "travel_summary_graph"]
+__all__ = ["get_od_pairs", "load_gbfs", "load_gtfs", "travel_summary_graph"]
 
 _ACTIVE_DATES_TABLE_SQL = """
     CREATE OR REPLACE TEMP TABLE _active_dates (
@@ -238,9 +244,16 @@ def _ensure_graph_sql_support(con: duckdb.DuckDBPyConnection) -> None:
             msg = "DuckDB spatial extension is required to build transport graph geometries."
             raise RuntimeError(msg) from error
 
-    # Usually raises duckdb.Error if the function already exists.
-    with suppress(duckdb.Error):
-        con.create_function("time_to_seconds", _time_to_seconds, ["VARCHAR"], "DOUBLE")
+    registered = con.execute(
+        "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'time_to_seconds'"
+    ).fetchone()
+    if registered is None or not registered[0]:
+        con.create_function(
+            "time_to_seconds",
+            _time_to_seconds,
+            [duckdb.sqltype("VARCHAR")],
+            duckdb.sqltype("DOUBLE"),
+        )
 
 
 def _ensure_stops_geometry(con: duckdb.DuckDBPyConnection) -> None:
@@ -517,7 +530,12 @@ def load_gtfs(path: str | Path) -> duckdb.DuckDBPyConnection:
     con.execute("INSTALL spatial; LOAD spatial;")
 
     # Register a scalar UDF used by SQL queries in this module.
-    con.create_function("time_to_seconds", _time_to_seconds, ["VARCHAR"], "DOUBLE")
+    con.create_function(
+        "time_to_seconds",
+        _time_to_seconds,
+        [duckdb.sqltype("VARCHAR")],
+        duckdb.sqltype("DOUBLE"),
+    )
 
     tmp_dir = tempfile.mkdtemp()
     has_files = False
@@ -550,6 +568,82 @@ def load_gtfs(path: str | Path) -> duckdb.DuckDBPyConnection:
         """)
 
     logger.info("GTFS loaded: %s", ", ".join(tables))
+    return con
+
+
+def load_gbfs(path: str | Path) -> duckdb.DuckDBPyConnection:
+    """
+    Load GBFS JSON feeds from a directory into an in-memory DuckDB database.
+
+    The function reads GBFS JSON files from a local directory, flattens common
+    feed structures into DuckDB tables, and materializes geometry columns from
+    ``lon``/``lat`` fields when available.
+
+    Parameters
+    ----------
+    path : str | Path
+        Path to a GBFS directory containing JSON files.
+
+    Returns
+    -------
+    duckdb.DuckDBPyConnection
+        In-memory DuckDB connection containing imported GBFS tables.
+    """
+    con = duckdb.connect(":memory:")
+    con.execute("INSTALL spatial; LOAD spatial;")
+    path = Path(path)
+    has_files = False
+    try:
+        for file_path in path.rglob("*.json"):
+            with file_path.open(encoding="utf-8") as f:
+                raw = json.load(f)
+            data = raw.get("data", {})
+            if "stations" in data:
+                rows = data["stations"]
+            elif "bikes" in data:
+                rows = data["bikes"]
+            elif "vehicles" in data:
+                rows = data["vehicles"]
+            elif "vehicle_types" in data:
+                rows = data["vehicle_types"]
+            elif "feeds" in data:
+                rows = data["feeds"]
+            else:
+                rows = [data]
+            if not rows:
+                continue
+            has_files = True
+            table_name = file_path.stem.replace("-", "_").lower()
+            df = pd.DataFrame(rows)
+            con.register("_gbfs_tmp", df)
+            con.execute(f"""
+                CREATE OR REPLACE TABLE {table_name} AS
+                SELECT *
+                FROM _gbfs_tmp
+            """)  # noqa: S608
+            con.unregister("_gbfs_tmp")
+    except (OSError, json.JSONDecodeError, duckdb.Error):
+        logger.exception("Failed to read GBFS data at %s", path)
+        return con
+    if not has_files:
+        logger.warning("No GBFS JSON files found in %s", path)
+        return con
+
+    tables = sorted(_list_tables(con))
+    for table in tables:
+        columns = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+        if {"lat", "lon"}.issubset(columns):
+            con.execute(f"""
+                ALTER TABLE {table} ADD COLUMN geometry GEOMETRY;
+                UPDATE {table}
+                SET geometry = ST_Point(
+                    CAST(lon AS DOUBLE),
+                    CAST(lat AS DOUBLE)
+                )
+                WHERE try_cast(lon AS DOUBLE) IS NOT NULL
+                  AND try_cast(lat AS DOUBLE) IS NOT NULL
+            """)  # noqa: S608
+    logger.info("GBFS loaded: %s", ", ".join(tables))
     return con
 
 
@@ -669,8 +763,8 @@ def get_od_pairs(
         cal_df = con.execute(
             "SELECT MIN(start_date) as s, MAX(end_date) as e FROM calendar"
         ).fetchone()
-        s_dt = start_date or cal_df[0]
-        e_dt = end_date or cal_df[1]
+        s_dt = start_date or (cal_df[0] if cal_df else None)
+        e_dt = end_date or (cal_df[1] if cal_df else None)
     else:
         if not start_date or not end_date:
             return pd.DataFrame()
@@ -748,10 +842,12 @@ def get_od_pairs(
         return pd.DataFrame()
 
     od_pairs_df["departure_ts"] = od_pairs_df.apply(
-        lambda row: _timestamp(row["departure_time"], row["active_date_str"]), axis=1
+        lambda row: _timestamp(row["departure_time"], row["active_date_str"]),
+        axis=1,  # type: ignore[call-overload]
     )
     od_pairs_df["arrival_ts"] = od_pairs_df.apply(
-        lambda row: _timestamp(row["arrival_time"], row["active_date_str"]), axis=1
+        lambda row: _timestamp(row["arrival_time"], row["active_date_str"]),
+        axis=1,  # type: ignore[call-overload]
     )
 
     od_pairs_df = od_pairs_df.dropna(subset=["departure_ts", "arrival_ts"])
@@ -1099,51 +1195,13 @@ def _build_travel_summary_nodes(con: duckdb.DuckDBPyConnection) -> gpd.GeoDataFr
     return nodes_gdf
 
 
-def _summary_graph_to_networkx(
-    nodes_gdf: gpd.GeoDataFrame,
-    edges_gdf: gpd.GeoDataFrame,
-    *,
-    directed: bool,
-) -> nx.DiGraph | nx.Graph:
-    """
-    Convert summary-graph GeoDataFrames into a NetworkX graph.
-
-    Node and edge attributes are copied row-wise so the NetworkX graph mirrors
-    the GeoDataFrame representation.
-
-    Parameters
-    ----------
-    nodes_gdf : gpd.GeoDataFrame
-        Summary graph nodes indexed by ``stop_id``.
-    edges_gdf : gpd.GeoDataFrame
-        Summary graph edges indexed by stop pairs.
-    directed : bool
-        Whether to create a directed or undirected graph.
-
-    Returns
-    -------
-    nx.DiGraph | nx.Graph
-        Graph populated with node and edge attributes.
-    """
-    graph = nx.DiGraph() if directed else nx.Graph()
-    graph.graph["crs"] = str(nodes_gdf.crs) if nodes_gdf.crs else None
-
-    for stop_id, row in nodes_gdf.iterrows():
-        graph.add_node(stop_id, **row.to_dict())
-
-    for (from_stop_id, to_stop_id), row in edges_gdf.iterrows():
-        graph.add_edge(from_stop_id, to_stop_id, **row.to_dict())
-
-    return graph
-
-
 def travel_summary_graph(
     con: duckdb.DuckDBPyConnection,
     start_time: str | None = None,
     end_time: str | None = None,
     calendar_start: str | None = None,
     calendar_end: str | None = None,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
     directed: bool = False,
     use_frequencies: bool = True,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.DiGraph | nx.Graph:
@@ -1182,8 +1240,14 @@ def travel_summary_graph(
         Optional calendar window start, ``YYYYMMDD``.
     calendar_end : str | None, default=None
         Optional calendar window end, ``YYYYMMDD``.
-    as_nx : bool, default=False
+    as_nx : bool, optional
         If ``True``, return a NetworkX graph instead of GeoDataFrames.
+        If not explicitly set, defaults to ``False`` (GeoDataFrame output).
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
     directed : bool, default=False
         If ``True``, return a directed graph (``nx.DiGraph``) preserving
         trip direction.  If ``False`` (default), edges in opposite
@@ -1197,8 +1261,23 @@ def travel_summary_graph(
     tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.DiGraph | nx.Graph
         ``(nodes_gdf, edges_gdf)`` when ``as_nx`` is ``False``; otherwise
         a ``nx.DiGraph`` (``directed=True``) or ``nx.Graph``
-        (``directed=False``) built from those GeoDataFrames.
+        (``directed=False``) built from those GeoDataFrames via
+        :func:`city2graph.utils.gdf_to_nx`, following its shared
+        conventions: integer node identifiers with the original
+        ``stop_id`` values stored in the ``_original_index`` node
+        attribute, node ``pos`` coordinates, and graph-level CRS and
+        index metadata.
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
     tables = _list_tables(con)
     required = {"stop_times", "stops", "trips"}
     if not required.issubset(tables):
@@ -1231,4 +1310,4 @@ def travel_summary_graph(
     if not as_nx:
         return nodes_gdf, edges_gdf
 
-    return _summary_graph_to_networkx(nodes_gdf, edges_gdf, directed=directed)
+    return gdf_to_nx(nodes=nodes_gdf, edges=edges_gdf, directed=directed)

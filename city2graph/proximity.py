@@ -14,6 +14,7 @@ from __future__ import annotations
 
 # Standard library imports
 import logging
+import warnings
 from dataclasses import dataclass
 from itertools import combinations
 from numbers import Real
@@ -24,6 +25,7 @@ from typing import cast
 
 if TYPE_CHECKING:  # Only needed for typing annotations
     from collections.abc import Iterable
+    from collections.abc import Iterator
 
 # Third-party imports
 import geopandas as gpd
@@ -33,13 +35,15 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 from scipy.spatial import Delaunay
+from scipy.spatial import cKDTree
 from scipy.spatial import distance as sdist
 from shapely.geometry import LineString
-from sklearn.neighbors import NearestNeighbors
 
 # Local imports
+from .base import GeoDataProcessor
 from .utils import gdf_to_nx
 from .utils import nx_to_gdf
+from .utils import symmetrize_edges
 from .utils import validate_gdf
 
 # Module logger configuration
@@ -139,7 +143,8 @@ class DistanceMetric:
     behind Euclidean, Manhattan, or network-based measurements. The class
     normalizes metric names, validates that required resources (such as a
     network GeoDataFrame) are available when needed, and provides methods
-    for computing distance matrices.
+    for computing distance matrices as well as sparse per-source network
+    distance rows that avoid materialising a dense matrix.
 
     Parameters
     ----------
@@ -190,6 +195,7 @@ class DistanceMetric:
             ]
             | None
         ) = None
+        self._net_kdtree: cKDTree | None = None
 
     def validate(self, crs: object) -> None:
         """
@@ -287,6 +293,75 @@ class DistanceMetric:
 
         return self._network_cache
 
+    def _snap_to_network(self, coords: npt.NDArray[np.floating]) -> list[Any]:
+        """
+        Map sample coordinates to their nearest network node IDs.
+
+        The lookup is served by a cached k-d tree over the network node
+        coordinates so that repeated snapping queries stay cheap.
+
+        Parameters
+        ----------
+        coords : npt.NDArray[np.floating]
+            Array of (x, y) coordinates to snap onto the network.
+
+        Returns
+        -------
+        list[Any]
+            Nearest network node ID for each input coordinate, in order.
+        """
+        _net_nx, _pos, net_coords, net_ids, _weight_attr = self._get_network_support()
+        if self._net_kdtree is None:
+            self._net_kdtree = cKDTree(net_coords)
+        _, idx = self._net_kdtree.query(coords)
+        return [net_ids[int(i)] for i in np.atleast_1d(idx)]
+
+    def _iter_network_rows(
+        self,
+        src_coords: npt.NDArray[np.floating],
+        dst_coords: npt.NDArray[np.floating] | None = None,
+        *,
+        cutoff: float | None = None,
+    ) -> Iterator[tuple[list[int], npt.NDArray[np.floating]]]:
+        """
+        Yield per-source network distance rows without a dense matrix.
+
+        Sources sharing the same snapped network node are grouped so that a
+        single Dijkstra traversal serves all of them, keeping memory usage
+        proportional to one row of distances at a time.
+
+        Parameters
+        ----------
+        src_coords : npt.NDArray[np.floating]
+            Coordinates of the source points.
+        dst_coords : npt.NDArray[np.floating], optional
+            Coordinates of the destination points. When omitted, the source
+            points also act as destinations.
+        cutoff : float, optional
+            Maximum shortest-path length explored by each Dijkstra traversal.
+            Destinations beyond the cutoff receive ``numpy.inf``.
+
+        Yields
+        ------
+        tuple[list[int], npt.NDArray[np.floating]]
+            Pair of source row indices sharing one snapped node and the array
+            of network distances from that node to every destination.
+        """
+        net_nx, _pos, _net_coords, _net_ids, weight_attr = self._get_network_support()
+        src_nearest = self._snap_to_network(src_coords)
+        dst_nearest = src_nearest if dst_coords is None else self._snap_to_network(dst_coords)
+
+        groups: dict[Any, list[int]] = {}
+        for i, node in enumerate(src_nearest):
+            groups.setdefault(node, []).append(i)
+
+        for node, indices in groups.items():
+            lengths = nx.single_source_dijkstra_path_length(
+                net_nx, node, cutoff=cutoff, weight=weight_attr
+            )
+            row = np.asarray([lengths.get(dn, np.inf) for dn in dst_nearest], dtype=float)
+            yield indices, row
+
     @staticmethod
     def _normalize_metric(metric: object) -> str:
         """
@@ -368,12 +443,10 @@ class DistanceMetric:
         npt.NDArray[np.floating]
             Network distance matrix.
         """
-        net_nx, _pos, net_coords, net_ids, weight_attr = self._get_network_support()
+        net_nx, _pos, _net_coords, _net_ids, weight_attr = self._get_network_support()
 
         # Map sample points to nearest network nodes
-        nn = NearestNeighbors(n_neighbors=1).fit(net_coords)
-        _, idx = nn.kneighbors(coords)
-        nearest = [net_ids[i[0]] for i in idx]
+        nearest = self._snap_to_network(coords)
 
         # Pre-allocate distance matrix
         n = len(coords)
@@ -433,6 +506,7 @@ class GraphBuilder:
         self.coords: npt.NDArray[np.floating] | None = None
         self.node_ids: list[Any] | None = None
         self.dm: npt.NDArray[np.floating] | None = None
+        self.network_cutoff: float | None = None
 
     def prepare_nodes(self, geometry: gpd.GeoSeries | None = None) -> None:
         """
@@ -580,26 +654,27 @@ class GraphBuilder:
         assert self.coords is not None
         assert self.node_ids is not None
 
-        net_nx, pos, net_coords, net_ids_list, weight_attr = self.metric._get_network_support()
+        net_nx, pos, _net_coords, _net_ids_list, weight_attr = self.metric._get_network_support()
 
-        nn = NearestNeighbors(n_neighbors=1).fit(net_coords)
-        _, idxs = nn.kneighbors(self.coords)
-        nearest = {self.node_ids[i]: net_ids_list[j[0]] for i, j in enumerate(idxs)}
+        snapped = self.metric._snap_to_network(self.coords)
+        nearest = {self.node_ids[i]: s for i, s in enumerate(snapped)}
 
-        edges_by_src: dict[Any, list[int]] = {}
+        # Group edges by snapped source node so co-located sources share a Dijkstra
+        edges_by_src_nn: dict[Any, list[int]] = {}
         for i, (u, _v) in enumerate(edges):
-            edges_by_src.setdefault(u, []).append(i)
+            edges_by_src_nn.setdefault(nearest[u], []).append(i)
 
         use_weight = weight_attr
         weights = [0.0] * len(edges)
         geoms = [LineString()] * len(edges)
 
-        for u, indices in edges_by_src.items():
-            src_nn = nearest[u]
-            dists, paths = nx.single_source_dijkstra(net_nx, src_nn, weight=use_weight)
+        for src_nn, indices in edges_by_src_nn.items():
+            dists, paths = nx.single_source_dijkstra(
+                net_nx, src_nn, cutoff=self.network_cutoff, weight=use_weight
+            )
 
             for i in indices:
-                _, v = edges[i]
+                u, v = edges[i]
                 dst_nn = nearest[v]
 
                 if self.dm is not None:
@@ -615,7 +690,9 @@ class GraphBuilder:
 
         return weights, geoms
 
-    def to_output(self, as_nx: bool) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
+    def to_output(
+        self, as_nx: bool, *, duplicate_edges: bool = False
+    ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
         """
         Return graph in requested format.
 
@@ -626,13 +703,65 @@ class GraphBuilder:
         ----------
         as_nx : bool
             If True, return a NetworkX graph. Otherwise, return GeoDataFrames.
+        duplicate_edges : bool, default False
+            If True, add the reverse (v, u) row of every undirected edge to
+            the edges GeoDataFrame. Only valid when ``as_nx`` is False.
 
         Returns
         -------
         tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph
             The generated graph.
         """
-        return self.G if as_nx else nx_to_gdf(self.G, nodes=True, edges=True)
+        if as_nx:
+            return self.G
+        nodes, edges = nx_to_gdf(self.G, nodes=True, edges=True)
+        if duplicate_edges:
+            edges = symmetrize_edges(edges)
+        return nodes, edges
+
+
+def _validate_duplicate_edges(
+    duplicate_edges: bool,
+    as_nx: bool,
+    target_gdf: gpd.GeoDataFrame | None = None,
+) -> None:
+    """
+    Validate ``duplicate_edges`` against incompatible output options.
+
+    Reciprocal (u, v) / (v, u) rows can only be represented in GeoDataFrame
+    output of undirected graphs, so conflicting combinations are rejected
+    before any computation happens.
+
+    Parameters
+    ----------
+    duplicate_edges : bool
+        Whether the caller requested reciprocal edge rows.
+    as_nx : bool
+        Whether the caller requested NetworkX output.
+    target_gdf : geopandas.GeoDataFrame, optional
+        Target GeoDataFrame triggering the directed graph variant, if any.
+
+    Raises
+    ------
+    ValueError
+        If ``duplicate_edges`` is combined with ``as_nx=True`` or with a
+        directed graph variant.
+    """
+    if not duplicate_edges:
+        return
+    if as_nx:
+        msg = (
+            "duplicate_edges=True is not supported with as_nx=True: an "
+            "undirected nx.Graph cannot hold reciprocal (u, v) and (v, u) "
+            "edges. Use as_nx=False to get a symmetrized edge GeoDataFrame."
+        )
+        raise ValueError(msg)
+    if target_gdf is not None:
+        msg = (
+            "duplicate_edges=True is not supported with target_gdf: the "
+            "resulting graph is directed, so its edges are not symmetrized."
+        )
+        raise ValueError(msg)
 
 
 # ============================================================================
@@ -648,7 +777,8 @@ def knn_graph(
     network_weight: str | None = None,
     *,
     target_gdf: gpd.GeoDataFrame | None = None,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
+    duplicate_edges: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
     r"""
     Generate a k-nearest neighbour graph from a GeoDataFrame of points.
@@ -681,9 +811,19 @@ def knn_graph(
         If provided, creates a directed graph where edges connect nodes from `gdf` to
         their k nearest neighbors in `target_gdf`. If None, creates an undirected graph
         within `gdf` itself.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If True, returns a NetworkX graph object. Otherwise, returns a tuple of
-        GeoDataFrames (nodes, edges).
+        GeoDataFrames (nodes, edges). If not explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
+    duplicate_edges : bool, default False
+        If True, the edges GeoDataFrame contains both (u, v) and (v, u) rows
+        for every undirected edge (roughly doubling the row count), so
+        neighbourhood queries on the MultiIndex are complete. Incompatible
+        with ``as_nx=True`` and with ``target_gdf`` (directed variant).
 
     Returns
     -------
@@ -698,7 +838,20 @@ def knn_graph(
     ValueError
         If `distance_metric` is "network" but `network_gdf` is not provided.
         If `k` is greater than or equal to the number of available nodes.
+        If `duplicate_edges` is True together with `as_nx=True` or `target_gdf`.
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
+    _validate_duplicate_edges(duplicate_edges, as_nx, target_gdf)
+
     # Handle directed variant
     if target_gdf is not None:
         return _directed_graph(
@@ -719,25 +872,27 @@ def knn_graph(
     assert builder.node_ids is not None
 
     if len(builder.coords) <= 1 or k <= 0:
-        return builder.to_output(as_nx)
+        return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
     if metric.name == "network":
-        builder.compute_distance_matrix()
-        assert builder.dm is not None
-        # Use argsort to find nearest neighbors in distance matrix
-        # Skip the first one (self)
-        order = np.argsort(builder.dm, axis=1)[:, 1 : k + 1]
+        # Per-source distance rows instead of a dense matrix.
+        # Skip the first sorted entry (self)
+        n = len(builder.coords)
+        selections: list[npt.NDArray[np.intp]] = [np.empty(0, dtype=np.intp)] * n
+        for indices, row in metric._iter_network_rows(builder.coords):
+            order = np.argsort(row)[1 : k + 1]
+            sel = order[row[order] < np.inf]
+            for i in indices:
+                selections[i] = sel
         edges = [
-            (builder.node_ids[i], builder.node_ids[j])
-            for i in range(len(builder.node_ids))
-            for j in order[i]
-            if builder.dm[i, j] < np.inf
+            (builder.node_ids[i], builder.node_ids[j]) for i in range(n) for j in selections[i]
         ]
     else:
-        nn_metric = "cityblock" if metric.name == "manhattan" else "euclidean"
+        p_norm = 1 if metric.name == "manhattan" else 2
         n_neigh = min(k + 1, len(builder.coords))
-        nn = NearestNeighbors(n_neighbors=n_neigh, metric=nn_metric).fit(builder.coords)
-        _, idxs = nn.kneighbors(builder.coords)
+        tree = cKDTree(builder.coords)
+        _, idxs = tree.query(builder.coords, k=n_neigh, p=p_norm)
+        idxs = idxs.reshape(len(builder.coords), -1)
         edges = [
             (builder.node_ids[i], builder.node_ids[j])
             for i, neigh in enumerate(idxs)
@@ -745,7 +900,7 @@ def knn_graph(
         ]
 
     builder.add_edges(edges)
-    return builder.to_output(as_nx)
+    return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
 
 def delaunay_graph(
@@ -754,7 +909,8 @@ def delaunay_graph(
     network_gdf: gpd.GeoDataFrame | None = None,
     network_weight: str | None = None,
     *,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
+    duplicate_edges: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
     r"""
     Generate a Delaunay triangulation graph from a GeoDataFrame of points.
@@ -777,9 +933,19 @@ def delaunay_graph(
     network_weight : str, optional
         Edge attribute name in `network_gdf` used as the path weight when
         `distance_metric` is ``"network"``. Defaults to geometry length.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If True, returns a NetworkX graph object. Otherwise, returns a tuple of
-        GeoDataFrames (nodes, edges).
+        GeoDataFrames (nodes, edges). If not explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
+    duplicate_edges : bool, default False
+        If True, the edges GeoDataFrame contains both (u, v) and (v, u) rows
+        for every undirected edge (roughly doubling the row count), so
+        neighbourhood queries on the MultiIndex are complete. Incompatible
+        with ``as_nx=True``.
 
     Returns
     -------
@@ -793,6 +959,7 @@ def delaunay_graph(
     ------
     ValueError
         If `distance_metric` is "network" but `network_gdf` is not provided.
+        If `duplicate_edges` is True together with `as_nx=True`.
 
     See Also
     --------
@@ -814,6 +981,18 @@ def delaunay_graph(
        Delaunay triangulation. International Journal of Computer & Information Sciences, 9(3),
        219-242. https://doi.org/10.1007/BF00977785
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
+    _validate_duplicate_edges(duplicate_edges, as_nx)
+
     metric = DistanceMetric(distance_metric, network_gdf, network_weight)
     builder = GraphBuilder(gdf, metric)
     builder.prepare_nodes()
@@ -821,7 +1000,7 @@ def delaunay_graph(
     assert builder.node_ids is not None
 
     if len(builder.coords) < 3:
-        return builder.to_output(as_nx)
+        return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
     tri = Delaunay(builder.coords)
     edges = {
@@ -831,7 +1010,7 @@ def delaunay_graph(
     }
 
     builder.add_edges(edges)
-    return builder.to_output(as_nx)
+    return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
 
 def gabriel_graph(
@@ -840,13 +1019,15 @@ def gabriel_graph(
     network_gdf: gpd.GeoDataFrame | None = None,
     network_weight: str | None = None,
     *,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
+    duplicate_edges: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
     r"""
     Generate a Gabriel graph from a GeoDataFrame of points.
 
-    In a Gabriel graph two nodes u and v are connected iff the closed disc that has
-    $uv$ as its diameter contains no other node of the set.
+    In a Gabriel graph two nodes u and v are connected iff the open disc that has
+    $uv$ as its diameter contains no other node of the set, i.e. no third node w
+    satisfies $d(u,w)^2 + d(v,w)^2 < d(u,v)^2$.
 
     Parameters
     ----------
@@ -859,9 +1040,19 @@ def gabriel_graph(
     network_weight : str, optional
         Edge attribute in `network_gdf` that supplies weights for network distances.
         Defaults to geometry length when not provided.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If True return a NetworkX graph, otherwise return two GeoDataFrames (nodes, edges)
-        via `nx_to_gdf`.
+        via `nx_to_gdf`. If not explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
+    duplicate_edges : bool, default False
+        If True, the edges GeoDataFrame contains both (u, v) and (v, u) rows
+        for every undirected edge (roughly doubling the row count), so
+        neighbourhood queries on the MultiIndex are complete. Incompatible
+        with ``as_nx=True``.
 
     Returns
     -------
@@ -870,6 +1061,11 @@ def gabriel_graph(
         - nodes_gdf: GeoDataFrame of nodes with spatial and attribute information
         - edges_gdf: GeoDataFrame of edges with 'weight' and 'geometry' attributes
         If `as_nx` is True, returns a NetworkX graph object with spatial attributes.
+
+    Raises
+    ------
+    ValueError
+        If `duplicate_edges` is True together with `as_nx=True`.
 
     Notes
     -----
@@ -886,6 +1082,18 @@ def gabriel_graph(
        variation analysis. Systematic zoology, 18(3), 259-278.
        https://doi.org/10.2307/2412323
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
+    _validate_duplicate_edges(duplicate_edges, as_nx)
+
     metric = DistanceMetric(distance_metric, network_gdf, network_weight)
     builder = GraphBuilder(gdf, metric)
     builder.prepare_nodes()
@@ -894,7 +1102,7 @@ def gabriel_graph(
 
     n_points = len(builder.coords)
     if n_points < 2:
-        return builder.to_output(as_nx)
+        return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
     # Candidate edges
     if n_points == 2:
@@ -908,19 +1116,15 @@ def gabriel_graph(
 
     # Gabriel filtering
     kept_edges = set()
-    tol = 1e-12
     coords = builder.coords
 
     for i, j in delaunay_edges:
-        mid = 0.5 * (coords[i] + coords[j])
-        rad2 = np.sum((coords[i] - coords[j]) ** 2) * 0.25
-        d2 = np.sum((coords - mid) ** 2, axis=1)
-        mask = d2 <= rad2 + tol
-        if np.count_nonzero(mask) == 2:
+        dots = np.einsum("ij,ij->i", coords[i] - coords, coords[j] - coords)
+        if not np.any(dots < 0.0):
             kept_edges.add((builder.node_ids[i], builder.node_ids[j]))
 
     builder.add_edges(kept_edges)
-    return builder.to_output(as_nx)
+    return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
 
 def relative_neighborhood_graph(
@@ -929,7 +1133,8 @@ def relative_neighborhood_graph(
     network_gdf: gpd.GeoDataFrame | None = None,
     network_weight: str | None = None,
     *,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
+    duplicate_edges: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
     r"""
     Generate a Relative-Neighbourhood Graph (RNG) from a GeoDataFrame.
@@ -949,9 +1154,19 @@ def relative_neighborhood_graph(
     network_weight : str, optional
         Edge attribute in `network_gdf` used for network distances. Defaults to
         geometry length when omitted.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If True return a NetworkX graph, otherwise return two GeoDataFrames (nodes, edges)
-        via `nx_to_gdf`.
+        via `nx_to_gdf`. If not explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
+    duplicate_edges : bool, default False
+        If True, the edges GeoDataFrame contains both (u, v) and (v, u) rows
+        for every undirected edge (roughly doubling the row count), so
+        neighbourhood queries on the MultiIndex are complete. Incompatible
+        with ``as_nx=True``.
 
     Returns
     -------
@@ -960,6 +1175,11 @@ def relative_neighborhood_graph(
         - nodes_gdf: GeoDataFrame of nodes with spatial and attribute information
         - edges_gdf: GeoDataFrame of edges with 'weight' and 'geometry' attributes
         If `as_nx` is True, returns a NetworkX graph object with spatial attributes.
+
+    Raises
+    ------
+    ValueError
+        If `duplicate_edges` is True together with `as_nx=True`.
 
     Notes
     -----
@@ -975,6 +1195,18 @@ def relative_neighborhood_graph(
        set. Pattern recognition, 12(4), 261-268.
        https://doi.org/10.1016/0031-3203(80)90066-7
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
+    _validate_duplicate_edges(duplicate_edges, as_nx)
+
     metric = DistanceMetric(distance_metric, network_gdf, network_weight)
     builder = GraphBuilder(gdf, metric)
     builder.prepare_nodes()
@@ -983,7 +1215,7 @@ def relative_neighborhood_graph(
 
     n_points = len(builder.coords)
     if n_points < 2:
-        return builder.to_output(as_nx)
+        return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
     if n_points == 2:
         cand_edges = {(0, 1)}
@@ -998,15 +1230,19 @@ def relative_neighborhood_graph(
     coords = builder.coords
 
     for i, j in cand_edges:
+        dots = np.einsum("ij,ij->i", coords[i] - coords, coords[j] - coords)
+        if np.any(dots < 0.0):
+            continue
         dij2 = np.dot(coords[i] - coords[j], coords[i] - coords[j])
-        di2 = np.sum((coords - coords[i]) ** 2, axis=1) < dij2
-        dj2 = np.sum((coords - coords[j]) ** 2, axis=1) < dij2
+        threshold = dij2 - np.finfo(float).eps * max(dij2, 1.0) * 64.0
+        di2 = np.sum((coords - coords[i]) ** 2, axis=1) < threshold
+        dj2 = np.sum((coords - coords[j]) ** 2, axis=1) < threshold
         closer_both = np.where(di2 & dj2)[0]
         if len(closer_both) == 0:
             kept_edges.add((builder.node_ids[i], builder.node_ids[j]))
 
     builder.add_edges(kept_edges)
-    return builder.to_output(as_nx)
+    return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
 
 def euclidean_minimum_spanning_tree(
@@ -1015,7 +1251,8 @@ def euclidean_minimum_spanning_tree(
     network_gdf: gpd.GeoDataFrame | None = None,
     network_weight: str | None = None,
     *,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
+    duplicate_edges: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
     r"""
     Generate a (generalised) Euclidean Minimum Spanning Tree from a GeoDataFrame of points.
@@ -1041,9 +1278,19 @@ def euclidean_minimum_spanning_tree(
     network_weight : str, optional
         Edge attribute name in `network_gdf` used for weighting shortest paths when
         `distance_metric='network'`. Defaults to geometry length.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If True return a NetworkX graph, otherwise return two GeoDataFrames (nodes, edges)
-        via `nx_to_gdf`.
+        via `nx_to_gdf`. If not explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
+    duplicate_edges : bool, default False
+        If True, the edges GeoDataFrame contains both (u, v) and (v, u) rows
+        for every undirected edge (roughly doubling the row count), so
+        neighbourhood queries on the MultiIndex are complete. Incompatible
+        with ``as_nx=True``.
 
     Returns
     -------
@@ -1052,6 +1299,11 @@ def euclidean_minimum_spanning_tree(
         - nodes_gdf: GeoDataFrame of nodes with spatial and attribute information
         - edges_gdf: GeoDataFrame of edges with 'weight' and 'geometry' attributes
         If `as_nx` is True, returns a NetworkX graph object with spatial attributes.
+
+    Raises
+    ------
+    ValueError
+        If `duplicate_edges` is True together with `as_nx=True`.
 
     See Also
     --------
@@ -1064,6 +1316,9 @@ def euclidean_minimum_spanning_tree(
     - The resulting graph always contains n - 1 edges (or 0 / 1 when the input has < 2 points).
     - For planar Euclidean inputs the computation is $O(n \\log n)$ thanks to the
       Delaunay pruning.
+    - For the ``manhattan`` and ``network`` metrics the candidate set is the complete
+      graph, so candidate-edge generation is inherently $O(n^2)$ in the number of edges;
+      the Delaunay sparsification applies to the Euclidean metric only.
     - All the usual spatial attributes (weight, geometry, CRS checks, etc.) are attached
       through the shared private helpers.
 
@@ -1074,6 +1329,18 @@ def euclidean_minimum_spanning_tree(
        SIGKDD international conference on Knowledge discovery and data mining (pp.
        603-612). https://doi.org/10.1145/1835804.1835882
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
+    _validate_duplicate_edges(duplicate_edges, as_nx)
+
     metric = DistanceMetric(distance_metric, network_gdf, network_weight)
     builder = GraphBuilder(gdf, metric)
     builder.prepare_nodes()
@@ -1082,7 +1349,7 @@ def euclidean_minimum_spanning_tree(
 
     n_points = len(builder.coords)
     if n_points < 2:
-        return builder.to_output(as_nx)
+        return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
     # Candidate edges
     if metric.name == "euclidean" and n_points >= 3:
@@ -1096,13 +1363,17 @@ def euclidean_minimum_spanning_tree(
     # Convert to node IDs
     named_edges = {(builder.node_ids[i], builder.node_ids[j]) for i, j in cand_edges}
 
-    # Add all candidate edges with weights
-    builder.compute_distance_matrix()  # Ensure DM is ready for weight assignment if needed
+    # Add all candidate edges; weights are computed per edge without a dense matrix
     builder.add_edges(named_edges)
 
     # Compute MST
     mst_G = nx.minimum_spanning_tree(builder.G, weight="weight", algorithm="kruskal")
-    return mst_G if as_nx else nx_to_gdf(mst_G, nodes=True, edges=True)
+    if as_nx:
+        return mst_G
+    nodes, edges = nx_to_gdf(mst_G, nodes=True, edges=True)
+    if duplicate_edges:
+        edges = symmetrize_edges(edges)
+    return nodes, edges
 
 
 def fixed_radius_graph(
@@ -1113,7 +1384,8 @@ def fixed_radius_graph(
     network_weight: str | None = None,
     *,
     target_gdf: gpd.GeoDataFrame | None = None,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
+    duplicate_edges: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
     r"""
     Generate a fixed-radius graph from a GeoDataFrame of points.
@@ -1146,9 +1418,19 @@ def fixed_radius_graph(
         If provided, creates a directed graph where edges connect nodes from `gdf` to
         nodes in `target_gdf` within the specified radius. If None, creates an undirected
         graph from `gdf` itself.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If True, returns a NetworkX graph object. Otherwise, returns a tuple of
-        GeoDataFrames (nodes, edges).
+        GeoDataFrames (nodes, edges). If not explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
+    duplicate_edges : bool, default False
+        If True, the edges GeoDataFrame contains both (u, v) and (v, u) rows
+        for every undirected edge (roughly doubling the row count), so
+        neighbourhood queries on the MultiIndex are complete. Incompatible
+        with ``as_nx=True`` and with ``target_gdf`` (directed variant).
 
     Returns
     -------
@@ -1163,6 +1445,7 @@ def fixed_radius_graph(
     ValueError
         If `distance_metric` is "network" but `network_gdf` is not provided.
         If `radius` is not positive.
+        If `duplicate_edges` is True together with `as_nx=True` or `target_gdf`.
 
     See Also
     --------
@@ -1184,6 +1467,18 @@ def fixed_radius_graph(
        finding fixed-radius near neighbors. Information processing letters, 6(6),
        209-212. https://doi.org/10.1016/0020-0190(77)90070-9
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
+    _validate_duplicate_edges(duplicate_edges, as_nx, target_gdf)
+
     if target_gdf is not None:
         return _directed_graph(
             src_gdf=gdf,
@@ -1203,22 +1498,23 @@ def fixed_radius_graph(
     assert builder.node_ids is not None
 
     if len(builder.coords) < 2:
-        return builder.to_output(as_nx)
+        return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
     if metric.name == "network":
-        builder.compute_distance_matrix()
-        assert builder.dm is not None
-        mask = (builder.dm <= radius) & np.triu(np.ones_like(builder.dm, dtype=bool), 1)
-        edge_idx = np.column_stack(np.where(mask))
+        # Cutoff-bounded per-source Dijkstra rows instead of a dense matrix
+        n = len(builder.coords)
+        selections: list[npt.NDArray[np.intp]] = [np.empty(0, dtype=np.intp)] * n
+        for indices, row in metric._iter_network_rows(builder.coords, cutoff=radius):
+            within = np.where(row <= radius)[0]
+            for i in indices:
+                selections[i] = within[within > i]
         edges = [
-            (builder.node_ids[i], builder.node_ids[j])
-            for i, j in edge_idx
-            if builder.dm[i, j] < np.inf
+            (builder.node_ids[i], builder.node_ids[j]) for i in range(n) for j in selections[i]
         ]
     else:
-        nn_metric = "cityblock" if metric.name == "manhattan" else "euclidean"
-        nn = NearestNeighbors(radius=radius, metric=nn_metric).fit(builder.coords)
-        idxs = nn.radius_neighbors(builder.coords, return_distance=False)
+        p_norm = 1 if metric.name == "manhattan" else 2
+        tree = cKDTree(builder.coords)
+        idxs = tree.query_ball_point(builder.coords, r=radius, p=p_norm)
         edges = [
             (builder.node_ids[i], builder.node_ids[j])
             for i, neigh in enumerate(idxs)
@@ -1226,9 +1522,10 @@ def fixed_radius_graph(
             if i < j
         ]
 
+    builder.network_cutoff = radius
     builder.add_edges(edges)
     builder.G.graph["radius"] = radius
-    return builder.to_output(as_nx)
+    return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
 
 def waxman_graph(
@@ -1240,7 +1537,8 @@ def waxman_graph(
     network_gdf: gpd.GeoDataFrame | None = None,
     network_weight: str | None = None,
     *,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
+    duplicate_edges: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
     r"""
     Generate a probabilistic Waxman graph from a GeoDataFrame of points.
@@ -1282,9 +1580,19 @@ def waxman_graph(
     network_weight : str, optional
         Edge attribute name in `network_gdf` used for network distances. Defaults to
         geometry length when omitted.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If True, returns a NetworkX graph object. Otherwise, returns a tuple of
-        GeoDataFrames (nodes, edges).
+        GeoDataFrames (nodes, edges). If not explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
+    duplicate_edges : bool, default False
+        If True, the edges GeoDataFrame contains both (u, v) and (v, u) rows
+        for every undirected edge (roughly doubling the row count), so
+        neighbourhood queries on the MultiIndex are complete. Incompatible
+        with ``as_nx=True``.
 
     Returns
     -------
@@ -1299,6 +1607,7 @@ def waxman_graph(
     ValueError
         If `distance_metric` is "network" but `network_gdf` is not provided.
         If `beta` is not between 0 and 1, or if `r0` is not positive.
+        If `duplicate_edges` is True together with `as_nx=True`.
 
     See Also
     --------
@@ -1314,6 +1623,10 @@ def waxman_graph(
     - The graph stores parameters in G.graph["beta"] and G.graph["r0"]
     - Results are stochastic; use seed parameter for reproducible outputs
     - The graph is undirected with symmetric edge probabilities
+    - Because every node pair is sampled, the implementation deliberately materialises
+      a dense n-by-n distance matrix and an n-by-n random draw ($O(n^2)$ memory,
+      roughly 8 GB for 50,000 nodes each). This keeps the seeded random stream stable
+      and is intended for moderate point counts.
 
     References
     ----------
@@ -1321,6 +1634,18 @@ def waxman_graph(
        selected areas in communications, 6(9), 1617-1622.
        https://doi.org/10.1109/49.12889
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
+    _validate_duplicate_edges(duplicate_edges, as_nx)
+
     rng = np.random.default_rng(seed)
     metric = DistanceMetric(distance_metric, network_gdf, network_weight)
     builder = GraphBuilder(gdf, metric)
@@ -1329,7 +1654,7 @@ def waxman_graph(
     assert builder.node_ids is not None
 
     if len(builder.coords) < 2:
-        return builder.to_output(as_nx)
+        return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
     builder.compute_distance_matrix()
     assert builder.dm is not None
@@ -1345,7 +1670,7 @@ def waxman_graph(
 
     builder.add_edges(edges)
     builder.G.graph.update({"beta": beta, "r0": r0})
-    return builder.to_output(as_nx)
+    return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
 
 def _normalize_layer_types(
@@ -1394,7 +1719,7 @@ def bridge_nodes(
     source_node_types: Iterable[str] | None = None,
     target_node_types: Iterable[str] | None = None,
     multigraph: bool = False,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
     **kwargs: float | str | bool,
 ) -> tuple[dict[str, gpd.GeoDataFrame], dict[tuple[str, str, str], gpd.GeoDataFrame]] | nx.Graph:
     r"""
@@ -1429,9 +1754,15 @@ def bridge_nodes(
     multigraph : bool, default False
         If True, the resulting NetworkX graph will be a MultiGraph, allowing
         multiple edges between the same pair of nodes from different proximity relationships.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If True, returns a NetworkX graph object containing all nodes and
         inter-layer edges. Otherwise, returns dictionaries of GeoDataFrames.
+        If not explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
     **kwargs : Any
         Additional keyword arguments passed to the underlying proximity method:
 
@@ -1498,6 +1829,16 @@ def bridge_nodes(
     - The resulting structure is ideal for heterogeneous graph neural networks,
       multi-layer network analysis, and cross-domain spatial relationship modeling
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
     if len(nodes_dict) < 2:
         msg = "`nodes_dict` needs at least two layers"
         raise ValueError(msg)
@@ -1506,7 +1847,6 @@ def bridge_nodes(
         msg = "proximity_method must be 'knn' or 'fixed_radius'"
         raise ValueError(msg)
 
-    edge_dict = {}
     method = proximity_method.lower()
     metric_name = str(kwargs.get("distance_metric", "euclidean"))
     net_gdf = kwargs.get("network_gdf")
@@ -1522,6 +1862,66 @@ def bridge_nodes(
     source_types = _normalize_layer_types(source_node_types, "source", node_order, node_set)
     target_types = _normalize_layer_types(target_node_types, "target", node_order, node_set)
 
+    edge_dict = _build_bridge_edges(
+        nodes_dict,
+        source_types,
+        target_types,
+        method=method,
+        param=param,
+        distance_metric=metric_name,
+        network_gdf=net_gdf,
+        network_weight=net_weight,
+    )
+
+    if as_nx:
+        return gdf_to_nx(nodes=nodes_dict, edges=edge_dict, multigraph=multigraph, directed=True)
+    return nodes_dict, edge_dict
+
+
+def _build_bridge_edges(
+    nodes_dict: dict[str, gpd.GeoDataFrame],
+    source_types: list[str],
+    target_types: list[str],
+    *,
+    method: str,
+    param: float,
+    distance_metric: str,
+    network_gdf: gpd.GeoDataFrame | None,
+    network_weight: str | None,
+) -> dict[tuple[str, str, str], gpd.GeoDataFrame]:
+    """
+    Build directed proximity edges for every ordered pair of node layers.
+
+    Iterates over the ordered (source, target) layer pairs, skipping
+    same-layer pairs, and computes the directed edges for each pair with the
+    requested proximity method, unwrapping the layer index back to the
+    original node IDs.
+
+    Parameters
+    ----------
+    nodes_dict : dict[str, geopandas.GeoDataFrame]
+        Mapping of node type to node GeoDataFrame.
+    source_types : list[str]
+        Ordered, validated source node types.
+    target_types : list[str]
+        Ordered, validated target node types.
+    method : str
+        ``"knn"`` or ``"fixed_radius"`` proximity strategy.
+    param : float
+        Method-specific parameter (``k`` or radius).
+    distance_metric : str
+        Metric name as understood by :class:`DistanceMetric`.
+    network_gdf : geopandas.GeoDataFrame | None
+        Supporting network data required for the ``network`` metric.
+    network_weight : str | None
+        Edge attribute used as weight for the ``network`` metric.
+
+    Returns
+    -------
+    dict[tuple[str, str, str], geopandas.GeoDataFrame]
+        Edge GeoDataFrames keyed by ``(source_type, 'is_nearby', target_type)``.
+    """
+    edge_dict = {}
     for src_type in source_types:
         for dst_type in target_types:
             if src_type == dst_type:
@@ -1533,27 +1933,20 @@ def bridge_nodes(
             _, edges_gdf = _directed_graph(
                 src_gdf=src_gdf,
                 dst_gdf=dst_gdf,
-                distance_metric=metric_name,
+                distance_metric=distance_metric,
                 method=method,
                 param=param,
                 as_nx=False,
-                network_gdf=net_gdf,
-                network_weight=net_weight,
+                network_gdf=network_gdf,
+                network_weight=network_weight,
                 return_nodes=False,
             )
 
             # Strip the ("src", id) and ("dst", id) wrappers to return original IDs
             if not edges_gdf.empty:
-                src_ids = [s[1] for s in edges_gdf.index.get_level_values(0)]
-                dst_ids = [d[1] for d in edges_gdf.index.get_level_values(1)]
-                edges_gdf.index = pd.MultiIndex.from_arrays(
-                    [src_ids, dst_ids], names=["source", "target"]
-                )
+                edges_gdf.index = GeoDataProcessor.unwrap_layer_edge_index(edges_gdf.index)
             edge_dict[(src_type, "is_nearby", dst_type)] = edges_gdf
-
-    if as_nx:
-        return gdf_to_nx(nodes=nodes_dict, edges=edge_dict, multigraph=multigraph, directed=True)
-    return nodes_dict, edge_dict
+    return edge_dict
 
 
 def group_nodes(
@@ -1566,7 +1959,7 @@ def group_nodes(
     predicate: str = "covered_by",
     node_geom_col: str | None = None,
     set_point_nodes: bool = False,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
 ) -> tuple[dict[str, gpd.GeoDataFrame], dict[tuple[str, str, str], gpd.GeoDataFrame]] | nx.Graph:
     r"""
     Create a heterogeneous graph linking polygon zones to contained points.
@@ -1606,9 +1999,15 @@ def group_nodes(
     set_point_nodes : bool, default False
         When True, set polygon node geometries to points (``node_geom_col`` when provided,
         otherwise centroids) and store original polygon geometries in ``original_geometry``.
-    as_nx : bool, default False
+    as_nx : bool, optional
         If False, return heterogeneous GeoDataFrame dictionaries. If True, return a
-        typed heterogeneous NetworkX graph built with `gdf_to_nx`.
+        typed heterogeneous NetworkX graph built with `gdf_to_nx`. If not
+        explicitly set, defaults to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
 
     Returns
     -------
@@ -1634,6 +2033,16 @@ def group_nodes(
       (_prepare_nodes, _distance_matrix, _add_edges) to ensure consistency with other
       proximity functions.
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
     relation = _relation_from_predicate(predicate)
     metric = DistanceMetric(distance_metric, network_gdf, network_weight)
 
@@ -1703,7 +2112,8 @@ def contiguity_graph(
     network_weight: str | None = None,
     node_geom_col: str | None = None,
     set_point_nodes: bool = False,
-    as_nx: bool = False,
+    as_nx: bool | None = None,
+    duplicate_edges: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame] | nx.Graph:
     r"""
     Generate a contiguity-based spatial graph from polygon geometries.
@@ -1755,10 +2165,22 @@ def contiguity_graph(
         If True, set node geometries as points (using ``node_geom_col`` when provided,
         otherwise polygon centroids) and store the original geometries as ``original_geometry``
         in the returned nodes GeoDataFrame and NetworkX graph metadata.
-    as_nx : bool, default False
+    as_nx : bool, optional
         Output format control. If True, returns a NetworkX Graph object with spatial
         attributes. If False, returns a tuple of GeoDataFrames for nodes and edges,
-        compatible with other city2graph functions.
+        compatible with other city2graph functions. If not explicitly set, defaults
+        to False.
+
+        .. deprecated::
+            ``as_nx`` is deprecated and will be removed in a future release.
+            Use :func:`gdf_to_nx` on the returned GeoDataFrames instead to
+            obtain a NetworkX graph.
+    duplicate_edges : bool, default False
+        If True, the edges GeoDataFrame contains both (u, v) and (v, u) rows
+        for every undirected edge (roughly doubling the row count), so
+        neighbourhood queries on the MultiIndex are complete, e.g.
+        ``edges_gdf.xs(node_id, level=0)`` returns every contiguity neighbour.
+        Incompatible with ``as_nx=True``.
 
     Returns
     -------
@@ -1775,6 +2197,7 @@ def contiguity_graph(
         If `gdf` contains geometries that are not polygons (Point, LineString, etc.).
         If `gdf` contains invalid or corrupt polygon geometries.
         If libpysal fails to create spatial weights matrix.
+        If `duplicate_edges` is True together with `as_nx=True`.
 
     See Also
     --------
@@ -1787,6 +2210,17 @@ def contiguity_graph(
     relative_neighborhood_graph : Generate relative neighborhood graphs.
     waxman_graph : Generate probabilistic Waxman graphs.
     """
+    if as_nx is not None:
+        warnings.warn(
+            "`as_nx` is deprecated and will be removed in a future release. "
+            "Use `gdf_to_nx()` on the returned GeoDataFrames instead to "
+            "obtain a NetworkX graph.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    as_nx = bool(as_nx)
+
+    _validate_duplicate_edges(duplicate_edges, as_nx)
     _validate_contiguity_input(gdf, contiguity)
     metric = DistanceMetric(distance_metric, network_gdf, network_weight)
     metric.validate(gdf.crs)
@@ -1825,7 +2259,7 @@ def contiguity_graph(
     builder.G.graph["contiguity"] = contiguity
     builder.G.graph["distance_metric"] = metric.name
 
-    return builder.to_output(as_nx)
+    return builder.to_output(as_nx, duplicate_edges=duplicate_edges)
 
 
 # ============================================================================
@@ -1851,7 +2285,7 @@ class DirectedGraphContext:
     unique_src_ids: list[tuple[str, Any]]
     unique_dst_ids: list[tuple[str, Any]]
     edges: list[tuple[Any, Any]]
-    dm: npt.NDArray[np.floating] | None
+    network_cutoff: float | None
     metric: DistanceMetric
 
 
@@ -1910,13 +2344,13 @@ def _directed_graph(
     src_ids = list(src_gdf.index)
     dst_ids = list(dst_gdf.index)
 
-    edges, dm = _directed_edges(
+    edges = _directed_edges(
         src_coords, dst_coords, src_ids, dst_ids, metric=metric, method=method, param=param
     )
 
     # Prepare namespaced IDs
-    unique_src_ids = [("src", sid) for sid in src_ids]
-    unique_dst_ids = [("dst", did) for did in dst_ids]
+    unique_src_ids = GeoDataProcessor.wrap_layer_ids(src_ids, "src")
+    unique_dst_ids = GeoDataProcessor.wrap_layer_ids(dst_ids, "dst")
 
     context = DirectedGraphContext(
         src_gdf=src_gdf,
@@ -1928,7 +2362,7 @@ def _directed_graph(
         unique_src_ids=unique_src_ids,
         unique_dst_ids=unique_dst_ids,
         edges=edges,
-        dm=dm,
+        network_cutoff=None if method == "knn" else param,
         metric=metric,
     )
 
@@ -1971,7 +2405,7 @@ def _directed_graph_gdf(
     dummy_builder = GraphBuilder(context.src_gdf, context.metric)
     dummy_builder.coords = combined_coords
     dummy_builder.node_ids = combined_ids
-    dummy_builder.dm = context.dm
+    dummy_builder.network_cutoff = context.network_cutoff
 
     weights, geoms = dummy_builder._compute_edge_data(namespaced_edges)
 
@@ -1987,18 +2421,12 @@ def _directed_graph_gdf(
 
     # Construct nodes GDF
     src_nodes = context.src_gdf.copy()
-    src_nodes.index = pd.MultiIndex.from_tuples(
-        [("src", i) for i in src_nodes.index],
-        names=["layer", context.src_gdf.index.name or "node_id"],
-    )
+    src_nodes.index = GeoDataProcessor.wrap_layer_index(src_nodes.index, "src")
     src_nodes["node_type"] = "src"
     src_nodes["_original_index"] = context.src_gdf.index
 
     dst_nodes = context.dst_gdf.copy()
-    dst_nodes.index = pd.MultiIndex.from_tuples(
-        [("dst", i) for i in dst_nodes.index],
-        names=["layer", context.dst_gdf.index.name or "node_id"],
-    )
+    dst_nodes.index = GeoDataProcessor.wrap_layer_index(dst_nodes.index, "dst")
     dst_nodes["node_type"] = "dst"
     dst_nodes["_original_index"] = context.dst_gdf.index
 
@@ -2054,7 +2482,7 @@ def _directed_graph_nx(context: DirectedGraphContext) -> nx.Graph:
     dummy_builder = GraphBuilder(context.src_gdf, context.metric)
     dummy_builder.coords = combined_coords
     dummy_builder.node_ids = combined_ids
-    dummy_builder.dm = context.dm
+    dummy_builder.network_cutoff = context.network_cutoff
     dummy_builder.G = G
 
     dummy_builder.add_edges(relabeled_edges)
@@ -2076,7 +2504,7 @@ def _directed_edges(
     metric: DistanceMetric,
     method: str,
     param: float,
-) -> tuple[list[tuple[int, int]], npt.NDArray[np.floating] | None]:
+) -> list[tuple[int, int]]:
     """
     Generate directed edges from source to destination nodes.
 
@@ -2098,47 +2526,38 @@ def _directed_edges(
 
     Returns
     -------
-    tuple[list[tuple[int, int]], numpy.typing.NDArray[np.floating] or None]
-        Pair of selected edges and the optional dense distance matrix.
+    list[tuple[int, int]]
+        Selected directed edges from source to destination identifiers.
     """
     if metric.name == "network":
-        # Compute network distances for all src+dst points
-        combined_coords = np.vstack([src_coords, dst_coords])
-        dm_full = metric.matrix(combined_coords)
-
+        # Per-source network distance rows instead of a dense (src+dst)^2 matrix
         src_n = len(src_coords)
-        dst_n = len(dst_coords)
-        d_sub = dm_full[:src_n, src_n : src_n + dst_n]
-        finite = np.isfinite(d_sub)
-
-        if method == "knn":
-            k = int(param)
-            order = np.argsort(d_sub, axis=1)
-            rows = np.arange(src_n)[:, None]
-            ranks = np.empty_like(order)
-            ranks[rows, order] = np.arange(dst_n)[None, :]
-            sel_mask = (ranks < k) & finite
-            i_idx, j_idx = np.where(sel_mask)
-        else:  # radius
-            i_idx, j_idx = np.where(finite & (d_sub <= param))
-
-        edges = list(zip((src_ids[i] for i in i_idx), (dst_ids[j] for j in j_idx), strict=True))
-        return edges, dm_full
+        selections: list[npt.NDArray[np.intp]] = [np.empty(0, dtype=np.intp)] * src_n
+        row_cutoff = None if method == "knn" else param
+        for indices, row in metric._iter_network_rows(src_coords, dst_coords, cutoff=row_cutoff):
+            if method == "knn":
+                top = np.argsort(row)[: int(param)]
+                sel = np.sort(top[row[top] < np.inf])
+            else:  # radius
+                sel = np.where(row <= param)[0]
+            for i in indices:
+                selections[i] = sel
+        return [(src_ids[i], dst_ids[j]) for i in range(src_n) for j in selections[i]]
 
     # Euclidean / Manhattan
-    nn_metric = "cityblock" if metric.name == "manhattan" else "euclidean"
+    p_norm = 1 if metric.name == "manhattan" else 2
+    tree = cKDTree(dst_coords)
     if method == "knn":
         k = int(param)
         n_neigh = min(k, len(dst_coords))
-        nn = NearestNeighbors(n_neighbors=n_neigh, metric=nn_metric).fit(dst_coords)
-        _, idxs = nn.kneighbors(src_coords)
+        _, idxs = tree.query(src_coords, k=n_neigh, p=p_norm)
+        idxs = idxs.reshape(len(src_coords), -1)
         edges = [(src_ids[i], dst_ids[j]) for i, neigh in enumerate(idxs) for j in neigh]
     else:  # radius
-        nn = NearestNeighbors(radius=param, metric=nn_metric).fit(dst_coords)
-        idxs = nn.radius_neighbors(src_coords, return_distance=False)
-        edges = [(src_ids[i], dst_ids[j]) for i, neigh in enumerate(idxs) for j in neigh]
+        neighbor_lists = tree.query_ball_point(src_coords, r=param, p=p_norm)
+        edges = [(src_ids[i], dst_ids[j]) for i, neigh in enumerate(neighbor_lists) for j in neigh]
 
-    return edges, None
+    return edges
 
 
 def _relation_from_predicate(predicate: str | None) -> str:
